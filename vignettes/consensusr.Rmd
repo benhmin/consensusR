@@ -1,0 +1,207 @@
+---
+title: "Using consensusR: output format and LLM agent integration"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Using consensusR: output format and LLM agent integration}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE # every chunk here calls the live API; none run during R CMD check
+)
+```
+
+```{r setup}
+library(consensusR)
+```
+
+This vignette covers two things that aren't obvious from the function
+reference alone: exactly what shape the returned data is in, and how to wire
+this package into an LLM agent - since that is expected to be one of the
+main ways this package gets used, not a secondary use case.
+
+## Searching
+
+```{r}
+consensus_search(
+  "Does creatine improve cognition?",
+  year_min = 2015,
+  study_types = c("rct", "meta-analysis")
+)
+```
+
+`study_types` and `domain` are validated **locally**, against
+[consensus_study_types()] and [consensus_domains()], before any request is
+sent. An invalid value raises an immediate error that lists every valid
+option, rather than a 422 from the API:
+
+```{r}
+consensus_search("x", study_types = "not_a_real_type")
+#> Error:
+#> ! Invalid value for `study_types`: "not_a_real_type".
+#> i Valid values are: "bench experiment", "case report", ..., "animal".
+```
+
+This matters more for this package than for a typical API wrapper: a human
+calling this interactively will typically copy a value from documentation,
+but a value chosen by an LLM agent from a natural-language prompt is far more
+likely to be a close-but-wrong guess (e.g. `"randomized controlled trial"`
+instead of `"rct"`). Local validation turns that into a fast, actionable
+error instead of a round trip to the API.
+
+`consensus_search()` returns one page (20 results by default, up to 1000 via
+`page_size`). `consensus_search_all()` follows pagination automatically,
+pausing one second between requests to respect the API's documented rate
+limit, and returns every page combined into one tibble:
+
+```{r}
+consensus_search_all(
+  "Does creatine improve cognition?",
+  study_types = c("rct", "meta-analysis"),
+  max_pages = 5
+)
+```
+
+## Output format
+
+Both functions return a `tibble`, one row per paper. The exact columns
+present can vary slightly between papers (a field the API has nothing to
+report simply isn't in that paper's JSON object, and becomes `NA` after
+row-binding), but as of this package's last verification against the live
+API, a result looks like this:
+
+```
+# A tibble: 5 x 22
+  title    abstract doi   journal_name pages publish_year url   volume
+  <chr>    <chr>    <chr> <chr>        <chr>        <int> <chr> <chr>
+  ...
+# i 14 more variables: citation_count <int>, study_type <chr>,
+#   takeaway <chr>, publisher_name <chr>, sjr_best_quartile <int>,
+#   study_count <int>, is_preprint <lgl>, countries_of_study <list>,
+#   study_duration_days <int>, influential_citation_count <int>,
+#   institutions <list>, publish_date <chr>, authors <list>,
+#   authors_str <chr>, semantic_score <dbl>, full_text_chunks <list>
+```
+
+**Reliable on every normal result:** `title`, `abstract`, `doi`, `url`,
+`journal_name`, `publisher_name`, `volume`, `pages`, `publish_year`,
+`publish_date`, `citation_count`, `influential_citation_count`,
+`study_type`, `is_preprint`, `takeaway`.
+
+**Present only when the API has the data for that paper (`NA` otherwise):**
+`sjr_best_quartile`, `sample_size`, `study_count`, `study_duration_days`,
+`population_type`. Do not assume these are populated - a `sample_size` of
+`NA` means "not reported by the API," not "zero."
+
+**List-columns**, because each paper has a variable number of entries:
+`authors`, `countries_of_study`, `institutions`, and (only when
+`include_full_text_chunks = TRUE` and the paper's full text is licensed on
+your plan) `full_text_chunks`. Unnest one with `tidyr::unnest()`:
+
+```{r}
+result <- consensus_search("statins and cardiovascular risk", page_size = 5)
+tidyr::unnest(result, authors) # one row per (paper, author) pair
+```
+
+`authors_str` is `authors` collapsed into a single `"; "`-separated string,
+added specifically because list-columns don't print in a `gt`/`knitr` table
+and are awkward for an LLM to reason about compared to a flat string. Prefer
+`authors_str` for display and for anything you hand to a model; keep
+`authors` for programmatic per-author work.
+
+`takeaway` is a short, AI-generated plain-language summary of the paper's
+finding - convenient for a quick scan or a dashboard tile, but it is a
+*generated summary*, not a verbatim quote. Verify it against `abstract` (or
+`full_text_chunks`, where licensed) before treating it as a citable claim in
+a report.
+
+Pagination metadata (`page`, `page_size`, `is_end`, `next_page`) is attached
+as **attributes** on the returned tibble, not extra columns:
+
+```{r}
+attr(result, "is_end")
+attr(result, "next_page")
+```
+
+### Building an evidence table
+
+```{r}
+library(dplyr)
+library(gt)
+
+consensus_search(
+  "statins and cardiovascular risk",
+  study_types = c("rct", "meta-analysis"),
+  page_size = 10
+) |>
+  select(title, authors_str, journal_name, publish_year, study_type, citation_count, takeaway) |>
+  arrange(desc(citation_count)) |>
+  gt() |>
+  tab_header(title = "Evidence summary: statins and cardiovascular risk")
+```
+
+## For LLM agents
+
+This package is expected to be called by LLM agents at least as often as by
+a human analyst writing a script - so "how an agent should search, and how
+it should read the result" is specified here explicitly, not left to be
+inferred from the general function reference.
+
+### Preferred path: `consensus_search_tool()`
+
+If your agent framework is [ellmer](https://ellmer.tidyverse.org), register
+the ready-made tool rather than hand-wrapping `consensus_search()`:
+
+```{r}
+chat <- ellmer::chat_anthropic()
+chat$register_tool(consensus_search_tool())
+chat$chat("Does creatine improve cognition? Cite RCTs or meta-analyses.")
+```
+
+This tool:
+
+- Declares `study_types` and `domain` as **enums** in the schema the model
+  sees (sourced from [consensus_study_types()] / [consensus_domains()]), so
+  a well-behaved model is constrained to valid values before it ever calls
+  the tool, rather than discovering the constraint from an error.
+- Returns a **flat list of records** - one list per paper, containing only
+  scalar fields (`title`, `authors_str`, `journal_name`, `publish_year`,
+  `doi`, `url`, `study_type`, `sample_size`, `citation_count`, `takeaway`,
+  `abstract`). List-columns (`authors`, `countries_of_study`,
+  `institutions`, `full_text_chunks`) and pagination attributes are
+  deliberately dropped here, because this is the representation the model
+  actually reads as tool output (serialized to text/JSON), and a flat list
+  of records is far more reliable for a model to parse and cite from than a
+  tibble with list-columns.
+- Defaults `page_size` to 10, not 20 - every extra result costs tokens in
+  the model's context window. Raise it only if you specifically want the
+  agent to see more candidates per search.
+
+### Building your own wrapper instead
+
+If you're integrating with a different agent framework, replicate this same
+contract rather than inventing a new one:
+
+1. Constrain `study_types` to [consensus_study_types()] and `domain` to
+   [consensus_domains()] in whatever schema format your framework uses.
+2. Return scalar fields only (see the list above) - drop list-columns and
+   pagination attributes before handing results to the model.
+3. Keep `page_size` small (10-20) by default for the same token-budget
+   reason.
+4. If your agent will present `takeaway` as a finding, have it (or your
+   prompt) also check `abstract` - `takeaway` is generated text, and an
+   agent repeating it as a direct quote without that check can
+   misrepresent the source.
+
+## Rate limits
+
+The Consensus API documents a limit of roughly one request per second on
+standard plans. `consensus_search_all()` and `consensus_search_tool()`'s
+single-call-per-turn design both respect this without extra effort on your
+part; if you're issuing many individual `consensus_search()` calls in a
+loop (e.g. one per item in a batch job), add `Sys.sleep(1)` between calls
+yourself.

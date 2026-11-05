@@ -1,0 +1,32 @@
+Package: consensusR
+Title: Client for the Consensus Academic Search API
+Version: 0.1.0
+Author: Ben Orwoll
+Maintainer: Ben Orwoll <benhmin@gmail.com>
+Description: A lightweight client for the Consensus (consensus.app)
+    academic literature search API. Provides functions to query the
+    api.consensus.app REST endpoint for peer-reviewed papers with
+    relevance ranking, citation counts, study metadata, and journal
+    quality signals, returning results as tibbles for use in downstream R
+    analysis, Shiny applications, and Quarto reports.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1.0)
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 8.0.0
+Imports:
+    cli,
+    dplyr,
+    httr2 (>= 1.0.0),
+    purrr,
+    tibble
+Suggests: 
+    ellmer,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    usethis,
+    withr
+Config/testthat/edition: 3
+VignetteBuilder: knitr
